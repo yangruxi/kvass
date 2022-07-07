@@ -19,12 +19,14 @@ package sidecar
 
 import (
 	"fmt"
-	"github.com/prometheus/prometheus/discovery"
 	"io/ioutil"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/discovery"
 	"tkestack.io/kvass/pkg/prom"
 	"tkestack.io/kvass/pkg/target"
 
@@ -41,6 +43,13 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+var (
+	injectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvass_sidecar_config_inject_total",
+		Help: "total count of config injection",
+	}, []string{"success"})
+)
+
 const (
 	paramJobName = "_jobName"
 	paramHash    = "_hash"
@@ -53,6 +62,8 @@ type InjectConfigOptions struct {
 	ProxyURL string
 	// PrometheusURL will be injected
 	PrometheusURL string
+	// ShardMonitorEnable is true, a self monitor will be injected
+	ShardMonitorEnable bool
 }
 
 // Injector gen injected config file
@@ -67,7 +78,10 @@ type Injector struct {
 }
 
 // NewInjector create new injector with InjectConfigOptions
-func NewInjector(outFile string, option InjectConfigOptions, log logrus.FieldLogger) *Injector {
+func NewInjector(outFile string, option InjectConfigOptions,
+	promRegistry prometheus.Registerer,
+	log logrus.FieldLogger) *Injector {
+	_ = promRegistry.Register(injectTotal)
 	return &Injector{
 		outFile:    outFile,
 		option:     option,
@@ -127,33 +141,35 @@ func (i *Injector) injectJobs(cfg *config.Config) error {
 }
 
 func (i *Injector) injectSelfMonitor(cfg *config.Config) {
-	if i.option.PrometheusURL != "" {
-		u, _ := url.Parse(i.option.PrometheusURL)
-		podName := os.Getenv("POD_NAME")
-		ss := strings.Split(podName, "-")
-		shard := "0"
-		if len(ss) > 0 {
-			shard = ss[len(ss)-1]
-		}
+	if !i.option.ShardMonitorEnable {
+		return
+	}
 
-		cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, &config.ScrapeConfig{
-			JobName: "prometheus_shards",
-			ServiceDiscoveryConfigs: []discovery.Config{
-				discovery.StaticConfig([]*targetgroup.Group{
-					{
-						Targets: []model.LabelSet{
-							{
-								model.AddressLabel: model.LabelValue(u.Host),
-							},
-						},
-						Labels: map[model.LabelName]model.LabelValue{
-							"replicate": model.LabelValue(podName),
-							"shard":     model.LabelValue(shard),
+	u, _ := url.Parse(i.option.PrometheusURL)
+	podName := os.Getenv("POD_NAME")
+	ss := strings.Split(podName, "-")
+	shard := "0"
+	if len(ss) > 0 {
+		shard = ss[len(ss)-1]
+	}
+
+	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, &config.ScrapeConfig{
+		JobName: "prometheus_shards",
+		ServiceDiscoveryConfigs: []discovery.Config{
+			discovery.StaticConfig([]*targetgroup.Group{
+				{
+					Targets: []model.LabelSet{
+						{
+							model.AddressLabel: model.LabelValue(u.Host),
 						},
 					},
-				}),
-			}})
-	}
+					Labels: map[model.LabelName]model.LabelValue{
+						"replicate": model.LabelValue(podName),
+						"shard":     model.LabelValue(shard),
+					},
+				},
+			}),
+		}})
 }
 
 func (i *Injector) marshal(cfg *config.Config) ([]byte, error) {
@@ -197,9 +213,12 @@ func (i *Injector) marshal(cfg *config.Config) ([]byte, error) {
 	return []byte(data), nil
 }
 
-func (i *Injector) inject() error {
+func (i *Injector) inject() (err error) {
+	defer injectTotal.WithLabelValues(fmt.Sprint(err == nil)).Inc()
+
 	i.Lock()
 	defer i.Unlock()
+
 	// create a default empty config for prometheus and thanos sidecar
 	if i.curCfg == prom.DefaultConfig {
 		return i.writeFile(i.outFile, i.curCfg.RawContent, 0755)

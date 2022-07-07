@@ -18,13 +18,15 @@
 package coordinator
 
 import (
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/sirupsen/logrus"
-	"net/http"
-	"net/url"
-	"testing"
 	"tkestack.io/kvass/pkg/api"
 	"tkestack.io/kvass/pkg/discovery"
 	"tkestack.io/kvass/pkg/prom"
@@ -215,7 +217,8 @@ func TestAPI_Targets(t *testing.T) {
 	}
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
-			a := NewService("", prom.NewConfigManager(), getScrapeStatus, getActive, getDrop, logrus.New())
+			a := NewService("", prom.NewConfigManager(), nil, getScrapeStatus, getActive, getDrop,
+				prometheus.NewRegistry(), logrus.New())
 			uri := "/api/v1/targets"
 			if len(cs.param) != 0 {
 				uri += "?" + cs.param.Encode()
@@ -231,7 +234,7 @@ func TestAPI_Targets(t *testing.T) {
 }
 
 func TestAPI_RuntimeInfo(t *testing.T) {
-	a := NewService("", prom.NewConfigManager(), func() map[uint64]*target.ScrapeStatus {
+	a := NewService("", prom.NewConfigManager(), nil, func() map[uint64]*target.ScrapeStatus {
 		return map[uint64]*target.ScrapeStatus{
 			1: {
 				Series: 100,
@@ -240,8 +243,8 @@ func TestAPI_RuntimeInfo(t *testing.T) {
 				Series: 100,
 			},
 		}
-	}, nil, nil, logrus.New())
+	}, nil, nil, prometheus.NewRegistry(), logrus.New())
 	res := &shard.RuntimeInfo{}
-	r, _ := api.TestCall(t, a.Engine.ServeHTTP, "/api/v1/shard/runtimeinfo", http.MethodGet, "", res)
+	r, _ := api.TestCall(t, a.Engine.ServeHTTP, "/api/v1/runtimeinfo", http.MethodGet, "", res)
 	r.Equal(int64(200), res.HeadSeries)
 }

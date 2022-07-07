@@ -17,17 +17,21 @@
 package sidecar
 
 import (
-	"github.com/prometheus/common/model"
 	"os"
 	"path"
+
+	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"tkestack.io/kvass/pkg/prom"
+
+	"testing"
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
-	"testing"
 	"tkestack.io/kvass/pkg/target"
 )
 
@@ -70,7 +74,8 @@ remote_read:
 		InjectConfigOptions{
 			ProxyURL:      "http://127.0.0.1:8008",
 			PrometheusURL: "http://127.0.0.1:9090",
-		}, logrus.New())
+		}, prometheus.NewRegistry(),
+		logrus.New())
 
 	r.NoError(in.ApplyConfig(&prom.ConfigInfo{
 		RawContent: []byte(cfg),
@@ -78,7 +83,7 @@ remote_read:
 	r.NoError(in.UpdateTargets(map[string][]*target.Target{
 		"job": {tar},
 	}))
-	out, err := config.LoadFile(outFile)
+	out, err := config.LoadFile(outFile, true, log.NewNopLogger())
 	r.NoError(err)
 
 	outJob := out.ScrapeConfigs[0]
@@ -90,8 +95,6 @@ remote_read:
 	r.Equal(model.LabelValue("https"), outSD.Labels[model.ParamLabelPrefix+paramScheme])
 	r.Equal(model.LabelValue("job"), outSD.Labels[model.ParamLabelPrefix+paramJobName])
 	r.Equal(model.LabelValue("1"), outSD.Labels[model.ParamLabelPrefix+paramHash])
-	r.Equal("write", string(out.RemoteWriteConfigs[0].HTTPClientConfig.BearerToken))
-	r.Equal("read", string(out.RemoteReadConfigs[0].HTTPClientConfig.BearerToken))
 
 	outSelf := out.ScrapeConfigs[1]
 	outSelfSD := outSelf.ServiceDiscoveryConfigs[0].(discovery.StaticConfig)[0]

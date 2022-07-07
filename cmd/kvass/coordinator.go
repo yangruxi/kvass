@@ -20,18 +20,21 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os"
+	"path"
+	"time"
+
 	"github.com/go-kit/kit/log"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/prometheus/config"
 	prom_discovery "github.com/prometheus/prometheus/discovery"
+	httpsd "github.com/prometheus/prometheus/discovery/http"
 	k8sd "github.com/prometheus/prometheus/discovery/kubernetes"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
-	"net/url"
-	"path"
-	"time"
 	"tkestack.io/kvass/pkg/prom"
 	"tkestack.io/kvass/pkg/shard"
 	"tkestack.io/kvass/pkg/shard/static"
@@ -47,25 +50,30 @@ import (
 )
 
 var cdCfg = struct {
-	shardType        string
-	shardStaticFile  string
-	shardNamespace   string
-	shardSelector    string
-	shardPort        int
-	shardMaxSeries   int64
-	shardMinShard    int32
-	shardMaxShard    int32
-	shardMaxIdleTime time.Duration
-	shardDeletePVC   bool
-	exploreMaxCon    int
-	webAddress       string
-	configFile       string
-	syncInterval     time.Duration
-	sdInitTimeout    time.Duration
-	configInject     configInjectOption
+	shardType              string
+	shardStaticFile        string
+	shardNamespace         string
+	shardSelector          string
+	shardPort              int
+	shardMaxHeadSeries     int64
+	shardMaxProcessSeries  int64
+	shardMinShard          int32
+	shardMaxShard          int32
+	shardMaxIdleTime       time.Duration
+	shardDisableAlleviate  bool
+	shardDeletePVC         bool
+	exploreMaxCon          int
+	scrapeKeepAliveDisable bool
+	webAddress             string
+	configFile             string
+	syncInterval           time.Duration
+	sdInitTimeout          time.Duration
+	configInject           configInjectOption
 }{}
 
 func init() {
+	coordinatorCmd.Flags().BoolVar(&cdCfg.shardDisableAlleviate, "shard.disable-alleviate", false,
+		"disable shard alleviation when shard is overload")
 	coordinatorCmd.Flags().StringVar(&cdCfg.shardType, "shard.type", "k8s",
 		"type of shard deploy: 'k8s'(default), 'static'")
 	coordinatorCmd.Flags().StringVar(&cdCfg.shardStaticFile, "shard.static-file", "static-shards.yaml",
@@ -76,8 +84,10 @@ func init() {
 		"label selector for select target StatefulSets [shard.type must be 'k8s']")
 	coordinatorCmd.Flags().IntVar(&cdCfg.shardPort, "shard.port", 8080,
 		"the port of sidecar server")
-	coordinatorCmd.Flags().Int64Var(&cdCfg.shardMaxSeries, "shard.max-series", 1000000,
-		"max series of per shard")
+	coordinatorCmd.Flags().Int64Var(&cdCfg.shardMaxHeadSeries, "shard.max-head-series", 0,
+		"max head series of per shard, skipped if 0")
+	coordinatorCmd.Flags().Int64Var(&cdCfg.shardMaxProcessSeries, "shard.max-process-series", 1000000,
+		"max head series of per shard, can not be 0")
 	coordinatorCmd.Flags().Int32Var(&cdCfg.shardMaxShard, "shard.max-shard", 999999,
 		"max shard number")
 	coordinatorCmd.Flags().Int32Var(&cdCfg.shardMinShard, "shard.min-shard", 0,
@@ -87,8 +97,10 @@ func init() {
 			"scale down is disabled if this flag is 0")
 	coordinatorCmd.Flags().BoolVar(&cdCfg.shardDeletePVC, "shard.delete-pvc", true,
 		"kvass will delete pvc when shard is removed")
-	coordinatorCmd.Flags().IntVar(&cdCfg.exploreMaxCon, "explore.concurrence", 1000,
+	coordinatorCmd.Flags().IntVar(&cdCfg.exploreMaxCon, "explore.concurrence", 200,
 		"max explore concurrence")
+	coordinatorCmd.Flags().BoolVar(&cdCfg.scrapeKeepAliveDisable, "scrape.disable-keep-alive", false,
+		"disable http keep alive")
 	coordinatorCmd.Flags().StringVar(&cdCfg.webAddress, "web.address", ":9090",
 		"server bind address")
 	coordinatorCmd.Flags().StringVar(&cdCfg.configFile, "config.file", "prometheus.yml",
@@ -100,7 +112,7 @@ func init() {
 	coordinatorCmd.Flags().StringVar(&cdCfg.configInject.kubernetes.url, "inject.kubernetes-url", "",
 		"kube-apiserver url to inject to all kubernetes sd")
 	coordinatorCmd.Flags().StringVar(&cdCfg.configInject.kubernetes.proxy, "inject.kubernetes-proxy", "",
-		"ckube-apiserver proxy url to inject to all kubernetes sd")
+		"kube-apiserver proxy url to inject to all kubernetes sd")
 	coordinatorCmd.Flags().StringVar(&cdCfg.configInject.kubernetes.serviceAccountPath, "inject.kubernetes-sa-path", "",
 		"change default service account token path")
 	rootCmd.AddCommand(coordinatorCmd)
@@ -116,36 +128,42 @@ distribution targets to shards`,
 			return err
 		}
 
+		if cdCfg.shardMaxProcessSeries == 0 {
+			return fmt.Errorf("shard.max-process-series can not be 0")
+		}
+
 		level := &promlog.AllowedLevel{}
 		level.Set("info")
 		format := &promlog.AllowedFormat{}
 		format.Set("logfmt")
 		var (
-			lg = logrus.New()
-
+			lg     = logrus.New()
 			logger = promlog.New(&promlog.Config{
 				Level:  level,
 				Format: format,
 			})
 
-			scrapeManager          = scrape.New(lg.WithField("component", "scrape discovery"))
+			scrapeManager          = scrape.New(cdCfg.scrapeKeepAliveDisable, lg.WithField("component", "scrape discovery"))
 			discoveryManagerScrape = prom_discovery.NewManager(context.Background(), log.With(logger, "component", "discovery manager scrape"), prom_discovery.Name("scrape"))
 			targetDiscovery        = discovery.New(lg.WithField("component", "target discovery"))
-			exp                    = explore.New(scrapeManager, lg.WithField("component", "explore"))
+			exp                    = explore.New(scrapeManager, promRegistry, lg.WithField("component", "explore"))
 			cfgManager             = prom.NewConfigManager()
 
 			cd = coordinator.NewCoordinator(
 				&coordinator.Option{
-					MaxSeries:   cdCfg.shardMaxSeries,
-					MaxShard:    cdCfg.shardMaxShard,
-					MinShard:    cdCfg.shardMinShard,
-					MaxIdleTime: cdCfg.shardMaxIdleTime,
-					Period:      cdCfg.syncInterval,
+					MaxHeadSeries:    cdCfg.shardMaxHeadSeries,
+					MaxProcessSeries: cdCfg.shardMaxProcessSeries,
+					MaxShard:         cdCfg.shardMaxShard,
+					MinShard:         cdCfg.shardMinShard,
+					MaxIdleTime:      cdCfg.shardMaxIdleTime,
+					Period:           cdCfg.syncInterval,
+					DisableAlleviate: cdCfg.shardDisableAlleviate,
 				},
 				getReplicasManager(lg),
 				cfgManager.ConfigInfo,
 				exp.Get,
 				targetDiscovery.ActiveTargetsByHash,
+				promRegistry,
 				lg.WithField("component", "coordinator"))
 		)
 
@@ -168,9 +186,11 @@ distribution targets to shards`,
 		svc := coordinator.NewService(
 			cdCfg.configFile,
 			cfgManager,
+			cd.LastScrapeStatistics,
 			cd.LastGlobalScrapeStatus,
 			targetDiscovery.ActiveTargets,
 			targetDiscovery.DropTargets,
+			promRegistry,
 			lg.WithField("component", "web"),
 		)
 
@@ -203,7 +223,8 @@ distribution targets to shards`,
 			return exp.Run(ctx, cdCfg.exploreMaxCon)
 		})
 
-		tCtx, _ := context.WithTimeout(ctx, cdCfg.sdInitTimeout)
+		tCtx, cancel := context.WithTimeout(ctx, cdCfg.sdInitTimeout)
+		defer cancel()
 		if err := targetDiscovery.WaitInit(tCtx); err != nil {
 			panic(err)
 		}
@@ -265,6 +286,13 @@ func configInject(cfg *config.Config, option *configInjectOption) error {
 			if ok {
 				configInjectK8s(ksd, option)
 			}
+			hsd, ok := sd.(*httpsd.SDConfig)
+			if ok && os.Getenv("SCRAPE_PROXY") != "" {
+				if hsd.HTTPClientConfig.ProxyURL.URL == nil {
+					u, _ := url.Parse(os.Getenv("SCRAPE_PROXY"))
+					hsd.HTTPClientConfig.ProxyURL = config_util.URL{URL: u}
+				}
+			}
 		}
 		configInjectServiceAccount(job, option)
 	}
@@ -304,8 +332,12 @@ func configInjectServiceAccount(job *config.ScrapeConfig, option *configInjectOp
 			job.HTTPClientConfig.TLSConfig.CAFile = path.Join(option.kubernetes.serviceAccountPath, "ca.crt")
 		}
 
-		if job.HTTPClientConfig.BearerTokenFile == "" || job.HTTPClientConfig.BearerTokenFile == "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		if job.HTTPClientConfig.BearerTokenFile == "/var/run/secrets/kubernetes.io/serviceaccount/token" {
 			job.HTTPClientConfig.BearerTokenFile = path.Join(option.kubernetes.serviceAccountPath, "token")
+		}
+
+		if job.HTTPClientConfig.Authorization != nil && job.HTTPClientConfig.Authorization.CredentialsFile == "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+			job.HTTPClientConfig.Authorization.CredentialsFile = path.Join(option.kubernetes.serviceAccountPath, "token")
 		}
 	}
 }

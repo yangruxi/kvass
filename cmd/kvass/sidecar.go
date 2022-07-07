@@ -18,7 +18,6 @@
 package main
 
 import (
-	"path"
 	"tkestack.io/kvass/pkg/scrape"
 	"tkestack.io/kvass/pkg/sidecar"
 	"tkestack.io/kvass/pkg/target"
@@ -32,14 +31,17 @@ import (
 )
 
 var sidecarCfg = struct {
-	configFile     string
-	configOutFile  string
-	proxyAddress   string
-	apiAddress     string
-	prometheusURL  string
-	storePath      string
-	injectProxyURL string
-	configInject   configInjectOption
+	configFile             string
+	configOutFile          string
+	proxyAddress           string
+	apiAddress             string
+	prometheusURL          string
+	storePath              string
+	injectProxyURL         string
+	fetchHeadSeries        bool
+	configInject           configInjectOption
+	scrapeKeepAliveDisable bool
+	shardMonitor           bool
 }{}
 
 func init() {
@@ -50,7 +52,7 @@ func init() {
 	sidecarCmd.Flags().StringVar(&sidecarCfg.prometheusURL, "prometheus.url", "http://127.0.0.1:9090",
 		"url of target prometheus")
 	sidecarCmd.Flags().StringVar(&sidecarCfg.configFile, "config.file", "/etc/prometheus/config_out/prometheus.env.yaml",
-		"origin config file, set this empty to enable POST /api/v1/status/config to update config")
+		"origin config file, set this empty to enable updating config from coordinator")
 	sidecarCmd.Flags().StringVar(&sidecarCfg.configOutFile, "config.output-file", "/etc/prometheus/config_out/prometheus_injected.yaml",
 		"injected config file")
 	sidecarCmd.Flags().StringVar(&sidecarCfg.storePath, "store.path", "/prometheus/",
@@ -59,6 +61,14 @@ func init() {
 		"proxy url to inject to all job")
 	sidecarCmd.Flags().StringVar(&sidecarCfg.configInject.kubernetes.serviceAccountPath, "inject.kubernetes-sa-path", "",
 		"change default service account token path")
+	sidecarCmd.Flags().BoolVar(&sidecarCfg.fetchHeadSeries, "shard.fetch-head-series", true,
+		"if true, prometheus head series will be used as runtimeinfo.HeadSeries."+
+			"otherwise, the sum of all scraping targets series will be used."+
+			"must set false if use vmagent (or other scraping agent) instead of prometheus.")
+	sidecarCmd.Flags().BoolVar(&sidecarCfg.scrapeKeepAliveDisable, "scrape.disable-keep-alive", false,
+		"disable http keep alive")
+	sidecarCmd.Flags().BoolVar(&sidecarCfg.shardMonitor, "shard.self-monitor", false,
+		"enable shard monitor")
 	rootCmd.AddCommand(sidecarCmd)
 }
 
@@ -72,21 +82,33 @@ var sidecarCmd = &cobra.Command{
 		}
 		var (
 			lg            = log.New()
-			scrapeManager = scrape.New(log.WithField("component", "scrape manager"))
+			scrapeManager = scrape.New(sidecarCfg.scrapeKeepAliveDisable, log.WithField("component", "scrape manager"))
 			configManager = prom.NewConfigManager()
-			targetManager = sidecar.NewTargetsManager(sidecarCfg.storePath, log.WithField("component", "targets manager"))
+			targetManager = sidecar.NewTargetsManager(
+				sidecarCfg.storePath,
+				promRegistry,
+				log.WithField("component", "targets manager"),
+			)
 
 			proxy = sidecar.NewProxy(
 				scrapeManager.GetJob,
 				func() map[uint64]*target.ScrapeStatus {
 					return targetManager.TargetsInfo().Status
 				},
+				configManager.ConfigInfo,
+				promRegistry,
 				log.WithField("component", "target manager"))
 
-			injector = sidecar.NewInjector(sidecarCfg.configOutFile, sidecar.InjectConfigOptions{
-				ProxyURL:      sidecarCfg.injectProxyURL,
-				PrometheusURL: sidecarCfg.prometheusURL,
-			}, lg.WithField("component", "injector"))
+			injector = sidecar.NewInjector(
+				sidecarCfg.configOutFile,
+				sidecar.InjectConfigOptions{
+					ProxyURL:           sidecarCfg.injectProxyURL,
+					PrometheusURL:      sidecarCfg.prometheusURL,
+					ShardMonitorEnable: sidecarCfg.shardMonitor,
+				},
+				promRegistry,
+				lg.WithField("component", "injector"),
+			)
 			promCli = prom.NewClient(sidecarCfg.prometheusURL)
 		)
 
@@ -110,14 +132,20 @@ var sidecarCmd = &cobra.Command{
 			sidecarCfg.configFile,
 			sidecarCfg.prometheusURL,
 			func() (i int64, e error) {
+				if !sidecarCfg.fetchHeadSeries {
+					return 0, nil
+				}
+
 				ts, err := promCli.TSDBInfo()
 				if err != nil {
 					return 0, err
 				}
+
 				return ts.HeadStats.NumSeries, nil
 			},
 			configManager,
 			targetManager,
+			promRegistry,
 			log.WithField("component", "web"),
 		)
 
@@ -153,14 +181,7 @@ func configInjectSidecar(cfg *config.Config, option *configInjectOption) error {
 	}
 
 	for _, job := range cfg.ScrapeConfigs {
-		if option.kubernetes.serviceAccountPath != "" {
-			if job.HTTPClientConfig.TLSConfig.CAFile == "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" {
-				job.HTTPClientConfig.TLSConfig.CAFile = path.Join(option.kubernetes.serviceAccountPath, "ca.crt")
-			}
-			if job.HTTPClientConfig.BearerTokenFile == "/var/run/secrets/kubernetes.io/serviceaccount/token" {
-				job.HTTPClientConfig.BearerTokenFile = path.Join(option.kubernetes.serviceAccountPath, "token")
-			}
-		}
+		configInjectServiceAccount(job, option)
 	}
 	return nil
 }

@@ -18,38 +18,56 @@
 package sidecar
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
 	"time"
+
+	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+	"tkestack.io/kvass/pkg/prom"
 	"tkestack.io/kvass/pkg/scrape"
 	"tkestack.io/kvass/pkg/target"
+)
 
-	"github.com/sirupsen/logrus"
+var (
+	proxyTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvass_sidecar_proxy_total",
+	}, []string{})
+	proxySeries = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvass_sidecar_proxy_target_series",
+	}, []string{"target_job", "url"})
+	proxyScrapeDurtion = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvass_sidecar_proxy_target_scrape_durtion",
+	}, []string{"target_job", "url"})
 )
 
 // Proxy is a Proxy server for prometheus tManager
 // Proxy will return an empty metrics if this target if not allowed to scrape for this prometheus client
 // otherwise, Proxy do real tManager, statistic metrics samples and return metrics to prometheus
 type Proxy struct {
-	targetsLock sync.Mutex
-	getJob      func(jobName string) *scrape.JobInfo
-	getStatus   func() map[uint64]*target.ScrapeStatus
-	log         logrus.FieldLogger
+	getJob    func(jobName string) *scrape.JobInfo
+	getStatus func() map[uint64]*target.ScrapeStatus
+	getCurCfg func() *prom.ConfigInfo
+	log       logrus.FieldLogger
 }
 
 // NewProxy create a new proxy server
 func NewProxy(
 	getJob func(jobName string) *scrape.JobInfo,
 	getStatus func() map[uint64]*target.ScrapeStatus,
+	getCurCfg func() *prom.ConfigInfo,
+	promRegistry prometheus.Registerer,
 	log logrus.FieldLogger) *Proxy {
+	_ = promRegistry.Register(proxyTotal)
+	_ = promRegistry.Register(proxySeries)
+	_ = promRegistry.Register(proxyScrapeDurtion)
 	return &Proxy{
 		getJob:    getJob,
 		getStatus: getStatus,
+		getCurCfg: getCurCfg,
 		log:       log,
 	}
 }
@@ -61,6 +79,9 @@ func (p *Proxy) Run(address string) error {
 
 // ServeHTTP handle one Proxy request
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	proxyTotal.WithLabelValues().Inc()
+	stopReason := p.getCurCfg().ExtraConfig.StopScrapeReason
+
 	job, hashStr, realURL := translateURL(*r.URL)
 	jobInfo := p.getJob(job)
 	if jobInfo == nil {
@@ -81,40 +102,51 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var scrapErr error
 	defer func() {
+		if scrapErr != nil {
+			p.log.Errorf(scrapErr.Error())
+			w.WriteHeader(http.StatusBadRequest)
+			if tar != nil {
+				tar.LastScrapeStatistics = scrape.NewStatisticsSeriesResult()
+			}
+		} else if stopReason != "" {
+			p.log.Warnf(stopReason)
+			w.WriteHeader(http.StatusBadRequest)
+			scrapErr = fmt.Errorf(stopReason)
+		}
+
 		if tar != nil {
 			tar.ScrapeTimes++
 			tar.SetScrapeErr(start, scrapErr)
 		}
-
-		if scrapErr != nil {
-			w.WriteHeader(http.StatusBadRequest)
-		}
 	}()
 
-	data, contentType, err := jobInfo.Scrape(realURL.String())
-	if err != nil {
-		scrapErr = fmt.Errorf("get data %v", err)
-		return
+	scraper := scrape.NewScraper(jobInfo, realURL.String(), p.log)
+	if stopReason == "" {
+		scraper.WithRawWriter(w)
 	}
 
-	series, err := scrape.StatisticSeries(data, contentType, jobInfo.Config.MetricRelabelConfigs)
-	if err != nil {
-		scrapErr = fmt.Errorf("StatisticSeries failed %v", err)
+	if err := scraper.RequestTo(); err != nil {
+		scrapErr = fmt.Errorf("RequestTo %s  %s %v", job, realURL.String(), err)
 		return
 	}
+	w.Header().Set("Content-Type", scraper.HTTPResponse.Header.Get("Content-Type"))
 
-	w.Header().Set("Content-Type", contentType)
-	// send origin result to prometheus
-	if _, err := io.Copy(w, bytes.NewBuffer(data)); err != nil {
+	rs := scrape.NewStatisticsSeriesResult()
+	if err := scraper.ParseResponse(func(rows []parser.Row) error {
+		scrape.StatisticSeries(rows, jobInfo.Config.MetricRelabelConfigs, rs)
+		return nil
+	}); err != nil {
 		scrapErr = fmt.Errorf("copy data to prometheus failed %v", err)
-		if time.Now().Sub(start) > time.Duration(jobInfo.Config.ScrapeTimeout) {
+		if time.Since(start) > time.Duration(jobInfo.Config.ScrapeTimeout) {
 			scrapErr = fmt.Errorf("scrape timeout")
 		}
 		return
 	}
 
+	proxySeries.WithLabelValues(jobInfo.Config.JobName, realURL.String()).Set(float64(rs.ScrapedTotal))
+	proxyScrapeDurtion.WithLabelValues(jobInfo.Config.JobName, realURL.String()).Set(float64(time.Now().Sub(start)))
 	if tar != nil {
-		tar.UpdateSeries(series)
+		tar.UpdateScrapeResult(rs)
 	}
 }
 

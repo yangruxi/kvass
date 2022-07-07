@@ -19,15 +19,20 @@ package sidecar
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+
 	"github.com/cssivision/reverseproxy"
 	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	"net/http"
-	"net/url"
 	"tkestack.io/kvass/pkg/api"
 	"tkestack.io/kvass/pkg/prom"
+	"tkestack.io/kvass/pkg/scrape"
 	"tkestack.io/kvass/pkg/shard"
+	"tkestack.io/kvass/pkg/utils/test"
 	"tkestack.io/kvass/pkg/utils/types"
 )
 
@@ -40,7 +45,7 @@ type Service struct {
 	targetManager *TargetsManager
 	promURL       string
 	getHeadSeries func() (int64, error)
-	paths         []string
+	localPaths    []string
 	runHTTP       func(addr string, handler http.Handler) error
 }
 
@@ -51,6 +56,7 @@ func NewService(
 	getHeadSeries func() (int64, error),
 	cfgManager *prom.ConfigManager,
 	targetManager *TargetsManager,
+	promeRegistry *prometheus.Registry,
 	lg logrus.FieldLogger) *Service {
 
 	s := &Service{
@@ -65,32 +71,42 @@ func NewService(
 	}
 
 	pprof.Register(s.ginEngine)
-	s.ginEngine.GET(s.path("/api/v1/shard/runtimeinfo/"), api.Wrap(s.lg, s.runtimeInfo))
-	s.ginEngine.GET(s.path("/api/v1/shard/targets/"), api.Wrap(s.lg, func(ctx *gin.Context) *api.Result {
+	h := api.NewHelper(s.lg, promeRegistry, "kvass_sidecar")
+
+	s.ginEngine.GET(s.localPath("/metrics"), h.MetricsHandler)
+	s.ginEngine.GET(s.localPath("/api/v1/shard/runtimeinfo/"), h.Wrap(s.runtimeInfo))
+	s.ginEngine.GET(s.localPath("/api/v1/shard/targets/status/"), h.Wrap(func(ctx *gin.Context) *api.Result {
 		return api.Data(s.targetManager.TargetsInfo().Status)
 	}))
-	s.ginEngine.POST(s.path("/api/v1/shard/targets/"), api.Wrap(s.lg, s.updateTargets))
-	s.ginEngine.POST(s.path("/-/reload/"), api.Wrap(lg, func(ctx *gin.Context) *api.Result {
+	s.ginEngine.GET(s.localPath("/api/v1/shard/targets/"), h.Wrap(func(ctx *gin.Context) *api.Result {
+		return api.Data(s.targetManager.TargetsInfo().Status)
+	}))
+	s.ginEngine.GET(s.localPath("/api/v1/shard/samples/"), h.Wrap(s.samples))
+	s.ginEngine.POST(s.localPath("/api/v1/shard/targets/"), h.Wrap(s.updateTargets))
+	s.ginEngine.POST(s.localPath("/-/reload/"), h.Wrap(func(ctx *gin.Context) *api.Result {
 		if err := s.cfgManager.ReloadFromFile(configFile); err != nil {
 			return api.BadDataErr(err, "reload failed")
 		}
 		return api.Data(nil)
 	}))
-	s.ginEngine.GET("/api/v1/status/config/", api.Wrap(lg, func(ctx *gin.Context) *api.Result {
+	s.ginEngine.GET("/api/v1/status/config/", h.Wrap(func(ctx *gin.Context) *api.Result {
 		return api.Data(gin.H{"yaml": string(s.cfgManager.ConfigInfo().RawContent)})
 	}))
-	s.ginEngine.POST(s.path("/api/v1/status/config/"), api.Wrap(lg, s.updateConfig))
-
+	s.ginEngine.POST(s.localPath("/api/v1/status/config/"), h.Wrap(s.updateConfig))
+	s.ginEngine.POST(s.localPath("/api/v1/status/extra_config/"), h.Wrap(s.updateExtraConfig))
+	s.ginEngine.GET("/api/v1/status/extra_config/", h.Wrap(func(ctx *gin.Context) *api.Result {
+		return api.Data(gin.H{"json": test.MustJSON(s.cfgManager.ConfigInfo().ExtraConfig)})
+	}))
 	return s
 }
 
-func (s *Service) path(p string) string {
-	s.paths = append(s.paths, p)
+func (s *Service) localPath(p string) string {
+	s.localPaths = append(s.localPaths, p)
 	return p
 }
 
 func (s *Service) ServeHTTP(wt http.ResponseWriter, r *http.Request) {
-	if types.FindStringVague(r.URL.Path, s.paths...) {
+	if types.FindStringVague(r.URL.Path, s.localPaths...) {
 		s.ginEngine.ServeHTTP(wt, r)
 		return
 	}
@@ -113,17 +129,20 @@ func (s *Service) runtimeInfo(g *gin.Context) *api.Result {
 	targets := s.targetManager.TargetsInfo()
 
 	min := int64(0)
+	total := int64(0)
 	for _, r := range targets.Status {
 		min += r.Series
+		total += r.TotalSeries
 	}
 
 	if series < min {
 		series = min
 	}
 	return api.Data(&shard.RuntimeInfo{
-		HeadSeries:  series,
-		ConfigHash:  s.cfgManager.ConfigInfo().ConfigHash,
-		IdleStartAt: targets.IdleAt,
+		HeadSeries:    series,
+		ProcessSeries: total,
+		ConfigHash:    s.cfgManager.ConfigInfo().ConfigHash,
+		IdleStartAt:   targets.IdleAt,
 	})
 }
 
@@ -140,9 +159,22 @@ func (s *Service) updateTargets(g *gin.Context) *api.Result {
 	return api.Data(nil)
 }
 
+func (s *Service) updateExtraConfig(g *gin.Context) *api.Result {
+	c := prom.ExtraConfig{}
+	if err := g.BindJSON(&c); err != nil {
+		return api.BadDataErr(err, "bind json")
+	}
+
+	if err := s.cfgManager.UpdateExtraConfig(c); err != nil {
+		return api.BadDataErr(err, "reload failed")
+	}
+
+	return api.Data(nil)
+}
+
 func (s *Service) updateConfig(g *gin.Context) *api.Result {
 	if s.configFile != "" {
-		s.lg.Warnf("config file is set, raw content config update is not allowed")
+		s.lg.Warn("config file is set, raw content config update is not allowed")
 		return api.BadDataErr(fmt.Errorf("config file is set, raw content config update is not allowed"), "")
 	}
 
@@ -156,4 +188,40 @@ func (s *Service) updateConfig(g *gin.Context) *api.Result {
 	}
 
 	return api.Data(nil)
+}
+
+func (s *Service) samples(ctx *gin.Context) *api.Result {
+	withMetricsDetail := ctx.Query("with_metrics_detail")
+	targetJob := ctx.Query("job")
+	ret := map[string]*scrape.StatisticsSeriesResult{}
+	status := s.targetManager.TargetsInfo().Status
+	for job, ts := range s.targetManager.TargetsInfo().Targets {
+		if targetJob != "" && !strings.Contains(job, targetJob) {
+			continue
+		}
+
+		result := scrape.NewStatisticsSeriesResult()
+		for _, t := range ts {
+			s := status[t.Hash]
+			if s == nil {
+				continue
+			}
+
+			result.ScrapedTotal += s.LastScrapeStatistics.ScrapedTotal
+			if withMetricsDetail == "true" {
+				for k, v := range s.LastScrapeStatistics.MetricsTotal {
+					m := result.MetricsTotal[k]
+					if result.MetricsTotal[k] == nil {
+						m = &scrape.MetricSamplesInfo{}
+						result.MetricsTotal[k] = m
+					}
+					m.Scraped += v.Scraped
+					m.Total += v.Total
+				}
+			}
+		}
+		ret[job] = result
+	}
+
+	return api.Data(ret)
 }

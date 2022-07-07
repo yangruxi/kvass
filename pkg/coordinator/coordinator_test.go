@@ -19,11 +19,15 @@ package coordinator
 
 import (
 	"fmt"
+	"testing"
+	"time"
+
+	kscrape "tkestack.io/kvass/pkg/scrape"
+
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
-	"testing"
-	"time"
 	"tkestack.io/kvass/pkg/discovery"
 	"tkestack.io/kvass/pkg/prom"
 	"tkestack.io/kvass/pkg/shard"
@@ -37,6 +41,7 @@ type testingShard struct {
 	targetStatus  map[uint64]*target.ScrapeStatus
 	resultTargets shard.UpdateTargetsRequest
 	wantTargets   shard.UpdateTargetsRequest
+	samplesInfo   map[uint64]*kscrape.StatisticsSeriesResult
 }
 
 func (ts *testingShard) assert(t *testing.T) {
@@ -65,8 +70,10 @@ func (f *fakeShardsManager) Shards() ([]*shard.Shard, error) {
 		temp := s
 		sd.APIGet = func(url string, ret interface{}) error {
 			dm := map[string]interface{}{
-				"/api/v1/shard/targets/":     temp.targetStatus,
-				"/api/v1/shard/runtimeinfo/": temp.rtInfo,
+				"/api/v1/shard/targets/":        temp.targetStatus,
+				"/api/v1/shard/targets/status/": temp.targetStatus,
+				"/api/v1/shard/runtimeinfo/":    temp.rtInfo,
+				"/api/v1/shard/samples/":        temp.samplesInfo,
 			}
 			return test.CopyJSON(ret, dm[url])
 		}
@@ -569,15 +576,22 @@ func TestCoordinator_RunOnce(t *testing.T) {
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
 			option := &Option{
-				MaxSeries:   cs.maxSeries,
-				MaxShard:    cs.maxShard,
-				MinShard:    cs.minShard,
-				MaxIdleTime: cs.maxIdleTime,
-				Period:      cs.period,
+				MaxHeadSeries: cs.maxSeries,
+				MaxShard:      cs.maxShard,
+				MinShard:      cs.minShard,
+				MaxIdleTime:   cs.maxIdleTime,
+				Period:        cs.period,
 			}
-			c := NewCoordinator(option, &fakeReplicasManager{cs.shardManager}, func() *prom.ConfigInfo {
-				return prom.DefaultConfig
-			}, cs.getExploreResult, cs.getActive, logrus.New())
+			c := NewCoordinator(option,
+				&fakeReplicasManager{cs.shardManager},
+				func() *prom.ConfigInfo {
+					return prom.DefaultConfig
+				},
+				cs.getExploreResult,
+				cs.getActive,
+				prometheus.NewRegistry(),
+				logrus.New(),
+			)
 			require.NoError(t, c.runOnce())
 			cs.shardManager.assert(t)
 		})
@@ -623,19 +637,27 @@ func TestCoordinator_LastGlobalScrapeStatus(t *testing.T) {
 	}
 
 	option := &Option{
-		MaxSeries:   100,
-		MaxShard:    100,
-		MinShard:    100,
-		MaxIdleTime: time.Second,
-		Period:      0,
+		MaxHeadSeries: 100,
+		MaxShard:      100,
+		MinShard:      100,
+		MaxIdleTime:   time.Second,
+		Period:        0,
 	}
-	c := NewCoordinator(option, &fakeReplicasManager{shardManager}, func() *prom.ConfigInfo {
-		return prom.DefaultConfig
-	}, getStatus, active, logrus.New())
+	c := NewCoordinator(option,
+		&fakeReplicasManager{shardManager}, func() *prom.ConfigInfo {
+			return prom.DefaultConfig
+		}, getStatus, active,
+		prometheus.NewRegistry(),
+		logrus.New(),
+	)
 
 	r := require.New(t)
 	r.NoError(c.runOnce())
 	g := c.LastGlobalScrapeStatus()
 	r.NotNil(g[1])
 	r.NotNil(g[2])
+}
+
+func TestCoordinator_LastScrapeStatistics(t *testing.T) {
+
 }

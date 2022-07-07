@@ -19,11 +19,13 @@ package prom
 
 import (
 	"fmt"
+	"io/ioutil"
+
+	"github.com/go-kit/log"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"io/ioutil"
 )
 
 const (
@@ -34,6 +36,17 @@ global:
 `
 )
 
+// ExtraConfig is config about kvass it self , not Prometheus config
+type ExtraConfig struct {
+	// StopScrapeReason ,if not empty, all scrape will failed
+	StopScrapeReason string `json:"stopScrapeReason"`
+}
+
+// EQ return true if all ExtraConfig fields is eq
+func (c *ExtraConfig) EQ(e *ExtraConfig) bool {
+	return c.StopScrapeReason == e.StopScrapeReason
+}
+
 // ConfigInfo include all information of current config
 type ConfigInfo struct {
 	// RawContent is the content of config file
@@ -42,13 +55,16 @@ type ConfigInfo struct {
 	ConfigHash string
 	// Config is the marshaled prometheus config
 	Config *config.Config
+	// ExtraConfig contains Config not in origin Prometheus define
+	ExtraConfig *ExtraConfig
 }
 
 // DefaultConfig init a ConfigInfo with default prometheus config
 var DefaultConfig = &ConfigInfo{
-	RawContent: []byte(defaultConfig),
-	ConfigHash: "",
-	Config:     &config.DefaultConfig,
+	RawContent:  []byte(defaultConfig),
+	ConfigHash:  "",
+	Config:      &config.DefaultConfig,
+	ExtraConfig: &ExtraConfig{},
 }
 
 // ConfigManager do config manager
@@ -61,7 +77,10 @@ type ConfigManager struct {
 func NewConfigManager() *ConfigManager {
 	return &ConfigManager{
 		currentConfig: &ConfigInfo{
-			Config: &config.DefaultConfig,
+			RawContent:  []byte(defaultConfig),
+			ConfigHash:  "",
+			Config:      &config.DefaultConfig,
+			ExtraConfig: &ExtraConfig{},
 		},
 	}
 }
@@ -77,13 +96,15 @@ func (c *ConfigManager) ReloadFromFile(file string) error {
 
 // ReloadFromRaw reload config from raw data
 func (c *ConfigManager) ReloadFromRaw(data []byte) (err error) {
-	info := &ConfigInfo{}
+	info := &ConfigInfo{
+		ExtraConfig: c.currentConfig.ExtraConfig,
+	}
 	info.RawContent = data
 	if len(info.RawContent) == 0 {
 		return errors.New("config content is empty")
 	}
 
-	info.Config, err = config.Load(string(data))
+	info.Config, err = config.Load(string(data), true, log.NewNopLogger())
 	if err != nil {
 		return errors.Wrapf(err, "marshal config")
 	}
@@ -106,6 +127,21 @@ func (c *ConfigManager) ReloadFromRaw(data []byte) (err error) {
 		}
 	}
 
+	return nil
+}
+
+// UpdateExtraConfig set new extra config
+func (c *ConfigManager) UpdateExtraConfig(cfg ExtraConfig) error {
+	if c.currentConfig.ExtraConfig.EQ(&cfg) {
+		return nil
+	}
+
+	c.currentConfig.ExtraConfig = &cfg
+	for _, f := range c.callbacks {
+		if err := f(c.currentConfig); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

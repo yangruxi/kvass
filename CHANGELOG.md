@@ -1,10 +1,37 @@
 
-## [v0.1.5] - 2021-09-02
+## [v0.3.1] - 2022-07-05
+### Fix
+- bugfix: dup transfer target ([#101](https://github.com/tkestack/kvass/issues/101))
+
+## [v0.3.0] - 2022-06-23
+### Fix
+- target gc and duplicate alleviate shard ([#96](https://github.com/tkestack/kvass/issues/96))
+
+## [v0.2.3] - 2022-06-17
+### Fix
+- miss 'break' in alleviate shard
+
+
+## [v0.2.2] - 2022-06-17
+### Fix
+- targets gc
+
+
+## [v0.2.1] - 2022-02-15
+
+## [v0.2.0] - 2022-01-03
 ### Feat
+- add metrics ([#82](https://github.com/tkestack/kvass/issues/82))
+- use stream model to reduce memory usage ([#81](https://github.com/tkestack/kvass/issues/81))
+- support-http-sd ([#74](https://github.com/tkestack/kvass/issues/74))
 - extend /api/v1/targets detail ([#66](https://github.com/tkestack/kvass/issues/66))
 - support static shards ([#64](https://github.com/tkestack/kvass/issues/64))
 
 ### Fix
+- may panic when waiting for first service discovery done ([#79](https://github.com/tkestack/kvass/issues/79))
+- statefulsets shards pods should be sort ([#77](https://github.com/tkestack/kvass/issues/77))
+- statefulsets shards pods should be sort ([#76](https://github.com/tkestack/kvass/issues/76))
+- some unit test ([#68](https://github.com/tkestack/kvass/issues/68))
 - fetching head series ([#53](https://github.com/tkestack/kvass/issues/53))
 
 

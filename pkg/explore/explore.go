@@ -20,17 +20,31 @@ package explore
 import (
 	"context"
 	"fmt"
+
 	"tkestack.io/kvass/pkg/discovery"
 	"tkestack.io/kvass/pkg/prom"
 	"tkestack.io/kvass/pkg/scrape"
 	"tkestack.io/kvass/pkg/utils/types"
 
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
 	"sync"
 	"time"
+
+	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
+
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"tkestack.io/kvass/pkg/target"
+)
+
+var (
+	exploredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvass_explore_explored_total",
+	}, []string{"job", "success"})
+	exploringTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvass_explore_exploring_total",
+	}, []string{"job"})
 )
 
 type exploringTarget struct {
@@ -50,11 +64,13 @@ type Explore struct {
 
 	retryInterval time.Duration
 	needExplore   chan *exploringTarget
-	explore       func(scrapeInfo *scrape.JobInfo, url string) (int64, error)
+	explore       func(log logrus.FieldLogger, scrapeInfo *scrape.JobInfo, url string) (*scrape.StatisticsSeriesResult, error)
 }
 
 // New create a new Explore
-func New(scrapeManager *scrape.Manager, log logrus.FieldLogger) *Explore {
+func New(scrapeManager *scrape.Manager, promRegistry prometheus.Registerer, log logrus.FieldLogger) *Explore {
+	_ = promRegistry.Register(exploredTotal)
+	_ = promRegistry.Register(exploringTotal)
 	return &Explore{
 		logger:        log,
 		scrapeManager: scrapeManager,
@@ -96,11 +112,21 @@ func (e *Explore) ApplyConfig(cfg *prom.ConfigInfo) error {
 	defer e.targetsLock.Unlock()
 
 	newTargets := map[uint64]*exploringTarget{}
+	deletedJobs := map[string]struct{}{}
 	for hash, v := range e.targets {
 		if types.FindString(v.job, jobs...) {
 			newTargets[hash] = v
+		} else {
+			deletedJobs[v.job] = struct{}{}
 		}
 	}
+
+	for job := range deletedJobs {
+		exploredTotal.DeleteLabelValues(job, "true")
+		exploredTotal.DeleteLabelValues(job, "false")
+		exploringTotal.DeleteLabelValues(job)
+	}
+
 	e.targets = newTargets
 	return nil
 }
@@ -119,7 +145,7 @@ func (e *Explore) UpdateTargets(targets map[string][]*discovery.SDTargets) {
 			} else {
 				all[hash] = &exploringTarget{
 					job:    job,
-					rt:     target.NewScrapeStatus(0),
+					rt:     target.NewScrapeStatus(0, 0),
 					target: t.ShardTarget,
 				}
 			}
@@ -166,26 +192,40 @@ func (e *Explore) Run(ctx context.Context, con int) error {
 
 func (e *Explore) exploreOnce(ctx context.Context, t *exploringTarget) (err error) {
 	defer t.rt.SetScrapeErr(time.Now(), err)
+	exploringTotal.WithLabelValues(t.job).Inc()
+	defer func() {
+		exploringTotal.WithLabelValues(t.job).Dec()
+		exploredTotal.WithLabelValues(t.job, fmt.Sprint(err == nil)).Inc()
+	}()
+
 	info := e.scrapeManager.GetJob(t.job)
 	if info == nil {
 		return fmt.Errorf("can not found %s  scrape info", t.job)
 	}
 
 	url := t.target.URL(info.Config).String()
-	series, err := e.explore(info, url)
+	result, err := e.explore(e.logger, info, url)
 	if err != nil {
 		return errors.Wrapf(err, "explore failed : %s/%s", t.job, url)
 	}
 
-	t.rt.Series = series
-	t.target.Series = series
+	t.rt.UpdateScrapeResult(result)
+	t.target.Series = int64(result.ScrapedTotal)
+	t.target.TotalSeries = int64(result.Total)
+	t.rt.LastScrapeStatistics = result
+
 	return nil
 }
 
-func explore(scrapeInfo *scrape.JobInfo, url string) (int64, error) {
-	data, typ, err := scrapeInfo.Scrape(url)
-	if err != nil {
-		return 0, err
+func explore(log logrus.FieldLogger, scrapeInfo *scrape.JobInfo, url string) (*scrape.StatisticsSeriesResult, error) {
+	scraper := scrape.NewScraper(scrapeInfo, url, log)
+	if err := scraper.RequestTo(); err != nil {
+		return nil, errors.Wrap(err, "request to ")
 	}
-	return scrape.StatisticSeries(data, typ, scrapeInfo.Config.MetricRelabelConfigs)
+
+	r := scrape.NewStatisticsSeriesResult()
+	return r, scraper.ParseResponse(func(rows []parser.Row) error {
+		scrape.StatisticSeries(rows, scrapeInfo.Config.MetricRelabelConfigs, r)
+		return nil
+	})
 }

@@ -21,14 +21,21 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
+	"time"
+
 	"tkestack.io/kvass/pkg/shard"
+	"tkestack.io/kvass/pkg/utils/test"
 	"tkestack.io/kvass/pkg/utils/types"
 
 	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/scrape"
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 	"github.com/sirupsen/logrus"
+	kscrape "tkestack.io/kvass/pkg/scrape"
 
 	"tkestack.io/kvass/pkg/api"
 	"tkestack.io/kvass/pkg/discovery"
@@ -40,59 +47,122 @@ import (
 type Service struct {
 	// gin.Engine is the gin engine for handle http request
 	*gin.Engine
-	configFile       string
-	lg               logrus.FieldLogger
-	cfgManager       *prom.ConfigManager
-	getScrapeStatus  func() map[uint64]*target.ScrapeStatus
-	getActiveTargets func() map[string][]*discovery.SDTargets
-	getDropTargets   func() map[string][]*discovery.SDTargets
+	configFile              string
+	lg                      logrus.FieldLogger
+	cfgManager              *prom.ConfigManager
+	getScrapeStatus         func() map[uint64]*target.ScrapeStatus
+	getLastScrapeStatistics func(jobName string, withoutMetricsDetail bool) (map[string]*kscrape.StatisticsSeriesResult, error)
+	getActiveTargets        func() map[string][]*discovery.SDTargets
+	getDropTargets          func() map[string][]*discovery.SDTargets
 }
 
 // NewService return a new web server
 func NewService(
 	configFile string,
 	cfgManager *prom.ConfigManager,
+	getLastScrapeStatistics func(jobName string, withoutMetricsDetail bool) (map[string]*kscrape.StatisticsSeriesResult, error),
 	getScrapeStatus func() map[uint64]*target.ScrapeStatus,
 	getActiveTargets func() map[string][]*discovery.SDTargets,
 	getDropTargets func() map[string][]*discovery.SDTargets,
+	promRegistry *prometheus.Registry,
 	lg logrus.FieldLogger) *Service {
+
 	w := &Service{
-		configFile:       configFile,
-		Engine:           gin.Default(),
-		lg:               lg,
-		cfgManager:       cfgManager,
-		getScrapeStatus:  getScrapeStatus,
-		getActiveTargets: getActiveTargets,
-		getDropTargets:   getDropTargets,
+		configFile:              configFile,
+		Engine:                  gin.Default(),
+		lg:                      lg,
+		cfgManager:              cfgManager,
+		getScrapeStatus:         getScrapeStatus,
+		getActiveTargets:        getActiveTargets,
+		getDropTargets:          getDropTargets,
+		getLastScrapeStatistics: getLastScrapeStatistics,
 	}
+
 	pprof.Register(w.Engine)
 
-	w.GET("/api/v1/targets", api.Wrap(lg, w.targets))
-	w.GET("/api/v1/shard/runtimeinfo", api.Wrap(lg, w.runtimeInfo))
-
-	w.POST("/-/reload", api.Wrap(lg, func(ctx *gin.Context) *api.Result {
+	h := api.NewHelper(lg, promRegistry, "kvass_coordinator")
+	w.GET("/metrics", h.MetricsHandler)
+	w.GET("/api/v1/targets", h.Wrap(w.targets))
+	w.GET("/api/v1/runtimeinfo", h.Wrap(w.runtimeInfo))
+	w.GET("/api/v1/samples", h.Wrap(w.samples))
+	w.POST("/-/reload", h.Wrap(func(ctx *gin.Context) *api.Result {
 		if err := w.cfgManager.ReloadFromFile(configFile); err != nil {
 			return api.BadDataErr(err, "reload failed")
 		}
 		return api.Data(nil)
 	}))
-	w.GET("/api/v1/status/config", api.Wrap(lg, func(ctx *gin.Context) *api.Result {
+
+	w.GET("/api/v1/status/config", h.Wrap(func(ctx *gin.Context) *api.Result {
 		return api.Data(gin.H{"yaml": string(cfgManager.ConfigInfo().RawContent)})
+	}))
+	w.POST("/api/v1/status/extra_config", h.Wrap(w.updateExtraConfig))
+	w.GET("/api/v1/status/extra_config", h.Wrap(func(ctx *gin.Context) *api.Result {
+		return api.Data(gin.H{"json": test.MustJSON(cfgManager.ConfigInfo().ExtraConfig)})
 	}))
 	return w
 }
 
-// runtimeInfo return statistics runtimeInfo of all shards
-func (s *Service) runtimeInfo(ctx *gin.Context) *api.Result {
-	series := int64(0)
-	for _, st := range s.getScrapeStatus() {
-		series += st.Series
+// samples return last scrape samples rate
+func (s *Service) samples(ctx *gin.Context) *api.Result {
+	var (
+		targetJob  = ctx.Query("job")
+		withDetail = ctx.Query("with_metrics_detail")
+	)
+	smp, err := s.getLastScrapeStatistics(targetJob, withDetail == "true")
+	if err != nil {
+		s.lg.Errorf(err.Error())
+		return api.InternalErr(err, "")
 	}
 
-	return api.Data(&shard.RuntimeInfo{
+	ret := map[string]*kscrape.StatisticsSeriesResult{}
+	for _, job := range s.cfgManager.ConfigInfo().Config.ScrapeConfigs {
+		if targetJob != "" && !strings.Contains(job.JobName, targetJob) {
+			continue
+		}
+
+		sm := smp[job.JobName]
+		if sm == nil {
+			ret[job.JobName] = kscrape.NewStatisticsSeriesResult()
+			continue
+		}
+
+		t := float64(job.ScrapeInterval / model.Duration(time.Second))
+		sm.ScrapedTotal /= t
+		for _, m := range sm.MetricsTotal {
+			m.Total /= t
+			m.Scraped /= t
+		}
+		ret[job.JobName] = sm
+	}
+
+	return api.Data(ret)
+}
+
+func (s *Service) updateExtraConfig(g *gin.Context) *api.Result {
+	c := prom.ExtraConfig{}
+	if err := g.BindJSON(&c); err != nil {
+		return api.BadDataErr(err, "bind json")
+	}
+
+	if err := s.cfgManager.UpdateExtraConfig(c); err != nil {
+		return api.BadDataErr(err, "reload failed")
+	}
+
+	return api.Data(nil)
+}
+
+// runtimeInfo return statistics runtimeInfo of all shards
+func (s *Service) runtimeInfo(ctx *gin.Context) *api.Result {
+	rt := &shard.RuntimeInfo{
 		ConfigHash: s.cfgManager.ConfigInfo().ConfigHash,
-		HeadSeries: series,
-	})
+	}
+
+	for _, st := range s.getScrapeStatus() {
+		rt.HeadSeries += st.Series
+		rt.ProcessSeries += st.TotalSeries
+	}
+
+	return api.Data(rt)
 }
 
 // ExtendTarget extend Prometheus v1.Target
@@ -101,6 +171,8 @@ type ExtendTarget struct {
 	v1.Target
 	// Series is the avg series of last 5 scraping results
 	Series int64 `json:"series"`
+	// TotalSeries is the total series without metrics_relabel
+	TotalSeries int64 `json:"totalSeries"`
 	// Shards contains ID of shards that is scraping this target
 	Shards []string `json:"shards"`
 }
@@ -205,7 +277,7 @@ func (s *Service) statisticActiveTargets(jobRegexp []*regexp.Regexp, health []st
 		for _, t := range activeTargets[jobName] {
 			rt := status[t.ShardTarget.Hash]
 			if rt == nil {
-				rt = target.NewScrapeStatus(0)
+				rt = target.NewScrapeStatus(0, 0)
 			}
 			jobSts.Total++
 			jobSts.Health[rt.Health]++
@@ -256,8 +328,9 @@ func makeTarget(jobName string, target *scrape.Target, rt *target.ScrapeStatus) 
 			LastScrapeDuration: rt.LastScrapeDuration,
 			Health:             rt.Health,
 		},
-		Series: rt.Series,
-		Shards: rt.Shards,
+		Series:      rt.Series,
+		Shards:      rt.Shards,
+		TotalSeries: rt.TotalSeries,
 	}
 }
 

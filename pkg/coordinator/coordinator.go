@@ -19,21 +19,40 @@ package coordinator
 
 import (
 	"context"
-	"github.com/pkg/errors"
+	"sync"
 	"time"
+
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
+
 	"tkestack.io/kvass/pkg/discovery"
 	"tkestack.io/kvass/pkg/prom"
+	"tkestack.io/kvass/pkg/scrape"
 	"tkestack.io/kvass/pkg/shard"
 	"tkestack.io/kvass/pkg/target"
 	"tkestack.io/kvass/pkg/utils/wait"
+)
 
-	"github.com/sirupsen/logrus"
+var (
+	coordinatorFailed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvass_coordinator_failed_total",
+	}, []string{})
+	assignNoScrapingTargetsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvass_coordinator_assign_targets_total",
+	}, []string{})
+	alleviateShardsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvass_coordinator_alleviate_shards_total",
+	}, []string{})
 )
 
 // Option indicate all coordinate arguments
 type Option struct {
-	// MaxSeries is max series every shard can assign
-	MaxSeries int64
+	// MaxHeadSeries is max series after metrics_relabels every shard can assign
+	MaxHeadSeries int64
+	// MaxProcessSeries is max series before metrics_relabels every shard can assign
+	MaxProcessSeries int64
 	// MaxShard is the max number we can scale up to
 	MaxShard int32
 	// MinShard is the min shard number that coordinator need
@@ -43,6 +62,8 @@ type Option struct {
 	MaxIdleTime time.Duration
 	// Period is the interval between every coordinating
 	Period time.Duration
+	// DisableAlleviate disable shard alleviation when shard is overload
+	DisableAlleviate bool
 }
 
 // Coordinator periodically re balance all replicates
@@ -64,7 +85,12 @@ func NewCoordinator(
 	getConfig func() *prom.ConfigInfo,
 	getExploreResult func(hash uint64) *target.ScrapeStatus,
 	getActive func() map[uint64]*discovery.SDTargets,
-	log logrus.FieldLogger) *Coordinator {
+	promRegisterer prometheus.Registerer,
+	log logrus.FieldLogger,
+) *Coordinator {
+	_ = promRegisterer.Register(coordinatorFailed)
+	_ = promRegisterer.Register(assignNoScrapingTargetsTotal)
+	_ = promRegisterer.Register(alleviateShardsTotal)
 	return &Coordinator{
 		reManager:        reManager,
 		getConfig:        getConfig,
@@ -85,12 +111,87 @@ func (c *Coordinator) LastGlobalScrapeStatus() map[uint64]*target.ScrapeStatus {
 	return c.lastGlobalScrapeStatus
 }
 
+// LastScrapeStatistics collect targets scrape sample statistic from all shards
+func (c *Coordinator) LastScrapeStatistics(jobName string, withMetricsDetail bool) (map[string]*scrape.StatisticsSeriesResult, error) {
+	rep, err := c.reManager.Replicas()
+	if err != nil {
+		return nil, err
+	}
+
+	ret := map[string]*scrape.StatisticsSeriesResult{}
+	for _, m := range rep {
+		w := errgroup.Group{}
+		rp := map[string]*scrape.StatisticsSeriesResult{}
+		lk := sync.Mutex{}
+		shards, err := m.Shards()
+		if err != nil {
+			c.log.Errorf(err.Error())
+			continue
+		}
+
+		for _, tmp := range shards {
+			s := tmp
+			if !s.Ready {
+				continue
+			}
+
+			w.Go(func() error {
+				sp, err := s.Samples(jobName, withMetricsDetail)
+				if err != nil {
+					return err
+				}
+				lk.Lock()
+				defer lk.Unlock()
+
+				for job, result := range sp {
+					item := rp[job]
+					if item == nil {
+						item = scrape.NewStatisticsSeriesResult()
+						rp[job] = item
+					}
+
+					item.ScrapedTotal += result.ScrapedTotal
+					for k, m := range result.MetricsTotal {
+						mi := item.MetricsTotal[k]
+						if mi == nil {
+							mi = &scrape.MetricSamplesInfo{}
+							item.MetricsTotal[k] = mi
+						}
+						mi.Total += m.Total
+						mi.Scraped += m.Scraped
+					}
+				}
+				return nil
+			})
+		}
+		_ = w.Wait()
+
+		// merget all replicas
+		for k, v := range rp {
+			if ret[k] == nil {
+				ret[k] = v
+			}
+		}
+	}
+	return ret, nil
+}
+
 // runOnce get shards information from shard manager,
 // do shard reBalance and change expect shard number
-func (c *Coordinator) runOnce() error {
+func (c *Coordinator) runOnce() (err error) {
+	defer func() {
+		if err != nil {
+			coordinatorFailed.WithLabelValues().Inc()
+		}
+	}()
+
 	replicas, err := c.reManager.Replicas()
 	if err != nil {
-		return errors.Wrapf(err, "get replicas")
+		return errors.Wrap(err, "get replicas")
+	}
+
+	if len(replicas) == 0 {
+		return errors.New("no shards replicas is found")
 	}
 
 	newLastGlobalScrapeStatus := map[uint64]*target.ScrapeStatus{}
@@ -117,11 +218,11 @@ func (c *Coordinator) runOnce() error {
 		lastGlobalScrapeStatus := c.globalScrapeStatus(active, shardsInfo)
 		c.gcTargets(changeAbleShards, active)
 		needSpace := c.alleviateShards(changeAbleShards)
-		needSpace += c.assignNoScrapingTargets(shardsInfo, active, lastGlobalScrapeStatus)
+		needSpace.add(c.assignNoScrapingTargets(shardsInfo, active, lastGlobalScrapeStatus))
 
 		scale := int32(len(shardsInfo))
-		if needSpace != 0 {
-			c.log.Infof("need space %d", needSpace)
+		if !needSpace.isZero() {
+			c.log.Infof("need space head space = %d, process space = %d", needSpace.headSpace, needSpace.processSpace)
 			scale = c.tryScaleUp(shardsInfo, needSpace)
 		} else if c.option.MaxIdleTime != 0 {
 			scale = c.tryScaleDown(shardsInfo)
